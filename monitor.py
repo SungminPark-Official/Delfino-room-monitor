@@ -157,15 +157,22 @@ def send_telegram(message: str) -> None:
 
 def save_debug_files(page: Page, prefix: str) -> None:
     """
-    현재 브라우저 상태를 여러 형식으로 저장합니다.
+    현재 페이지 상태를 다각도로 저장합니다.
 
-    저장 파일:
-    - viewport PNG
-    - full-page PNG
-    - HTML
-    - 화면 텍스트
-    - 브라우저 진단 JSON
+    생성 파일:
+    - {prefix}-viewport.png
+    - {prefix}-full.png
+    - {prefix}.html
+    - {prefix}-inner-text.txt
+    - {prefix}-text-content.txt
+    - {prefix}-scroll-snapshots.txt
+    - {prefix}-embedded-data.txt
+    - {prefix}-diagnostic.json
     """
+
+    # ------------------------------------------------------------------
+    # 1. 현재 viewport 스크린샷
+    # ------------------------------------------------------------------
 
     try:
         page.screenshot(
@@ -179,6 +186,10 @@ def save_debug_files(page: Page, prefix: str) -> None:
     except Exception as exc:
         print(f"Viewport screenshot failed: {exc}")
 
+    # ------------------------------------------------------------------
+    # 2. 전체 페이지 스크린샷
+    # ------------------------------------------------------------------
+
     try:
         page.screenshot(
             path=str(ARTIFACT_DIR / f"{prefix}-full.png"),
@@ -191,50 +202,650 @@ def save_debug_files(page: Page, prefix: str) -> None:
     except Exception as exc:
         print(f"Full-page screenshot failed: {exc}")
 
+    # ------------------------------------------------------------------
+    # 3. 전체 HTML
+    # ------------------------------------------------------------------
+
+    html = ""
+
     try:
         html = page.content()
-        html_path = ARTIFACT_DIR / f"{prefix}.html"
-        html_path.write_text(html, encoding="utf-8")
+
+        (
+            ARTIFACT_DIR / f"{prefix}.html"
+        ).write_text(
+            html,
+            encoding="utf-8",
+        )
+
         print(f"Saved: {prefix}.html")
     except Exception as exc:
         print(f"HTML save failed: {exc}")
 
+    # ------------------------------------------------------------------
+    # 4. 현재 화면에서 보이는 텍스트: innerText
+    # ------------------------------------------------------------------
+
     try:
-        body_text = page.locator("body").inner_text(timeout=10_000)
-        text_path = ARTIFACT_DIR / f"{prefix}.txt"
-        text_path.write_text(body_text, encoding="utf-8")
-        print(f"Saved: {prefix}.txt")
+        inner_text = page.locator("body").inner_text(
+            timeout=10_000,
+        )
+
+        (
+            ARTIFACT_DIR / f"{prefix}-inner-text.txt"
+        ).write_text(
+            inner_text,
+            encoding="utf-8",
+        )
+
+        print(
+            f"Saved: {prefix}-inner-text.txt "
+            f"({len(inner_text)} characters)"
+        )
     except Exception as exc:
-        print(f"Body text save failed: {exc}")
+        print(f"Body innerText save failed: {exc}")
+
+    # ------------------------------------------------------------------
+    # 5. 숨겨진 DOM 요소까지 포함한 텍스트: textContent
+    # ------------------------------------------------------------------
+
+    try:
+        text_content = (
+            page.locator("body").text_content(
+                timeout=10_000,
+            )
+            or ""
+        )
+
+        (
+            ARTIFACT_DIR / f"{prefix}-text-content.txt"
+        ).write_text(
+            text_content,
+            encoding="utf-8",
+        )
+
+        print(
+            f"Saved: {prefix}-text-content.txt "
+            f"({len(text_content)} characters)"
+        )
+    except Exception as exc:
+        print(f"Body textContent save failed: {exc}")
+
+    # ------------------------------------------------------------------
+    # 6. 스크롤 각 지점에서 보이는 텍스트 누적
+    # ------------------------------------------------------------------
+
+    try:
+        scroll_result = page.evaluate(
+            """
+            async () => {
+              const delay = (ms) =>
+                new Promise((resolve) =>
+                  setTimeout(resolve, ms)
+                );
+
+              const normalize = (value) =>
+                (value || '')
+                  .replace(/\\s+/g, ' ')
+                  .trim();
+
+              const snapshots = [];
+              const seenTexts = new Set();
+
+              const saveSnapshot = (
+                source,
+                position,
+                element = null
+              ) => {
+                const text = normalize(
+                  element
+                    ? element.innerText
+                    : document.body?.innerText
+                );
+
+                if (!text || seenTexts.has(text)) {
+                  return;
+                }
+
+                seenTexts.add(text);
+
+                snapshots.push({
+                  source,
+                  position,
+                  textLength: text.length,
+                  text
+                });
+              };
+
+              const getDocumentHeight = () =>
+                Math.max(
+                  document.body?.scrollHeight ?? 0,
+                  document.documentElement?.scrollHeight ?? 0
+                );
+
+              /*
+               * 전체 문서 스크롤.
+               * 끝에서 한 번 읽는 것이 아니라 각 위치의 텍스트를 저장합니다.
+               */
+              let previousDocumentHeight = -1;
+
+              for (let cycle = 0; cycle < 4; cycle += 1) {
+                const documentHeight =
+                  getDocumentHeight();
+
+                const step = Math.max(
+                  Math.floor(window.innerHeight * 0.55),
+                  400
+                );
+
+                for (
+                  let position = 0;
+                  position <= documentHeight;
+                  position += step
+                ) {
+                  window.scrollTo({
+                    top: position,
+                    left: 0,
+                    behavior: 'instant'
+                  });
+
+                  await delay(650);
+
+                  saveSnapshot(
+                    'window',
+                    window.scrollY
+                  );
+                }
+
+                window.scrollTo({
+                  top: documentHeight,
+                  left: 0,
+                  behavior: 'instant'
+                });
+
+                await delay(1200);
+
+                saveSnapshot(
+                  'window-bottom',
+                  window.scrollY
+                );
+
+                const newHeight =
+                  getDocumentHeight();
+
+                if (
+                  newHeight === previousDocumentHeight
+                ) {
+                  break;
+                }
+
+                previousDocumentHeight =
+                  newHeight;
+              }
+
+              /*
+               * overflow:auto 또는 overflow:scroll인
+               * 내부 스크롤 컨테이너도 순회합니다.
+               */
+              const scrollContainers =
+                Array.from(
+                  document.querySelectorAll('*')
+                ).filter((element) => {
+                  const style =
+                    window.getComputedStyle(element);
+
+                  const overflowY =
+                    style.overflowY;
+
+                  return (
+                    ['auto', 'scroll'].includes(
+                      overflowY
+                    ) &&
+                    element.scrollHeight >
+                      element.clientHeight + 100 &&
+                    element.clientHeight > 100
+                  );
+                });
+
+              const containerDiagnostics = [];
+
+              for (
+                let index = 0;
+                index < scrollContainers.length;
+                index += 1
+              ) {
+                const element =
+                  scrollContainers[index];
+
+                const maxScroll =
+                  element.scrollHeight -
+                  element.clientHeight;
+
+                const step = Math.max(
+                  Math.floor(
+                    element.clientHeight * 0.55
+                  ),
+                  250
+                );
+
+                containerDiagnostics.push({
+                  index,
+                  tag: element.tagName,
+                  className:
+                    typeof element.className === 'string'
+                      ? element.className
+                      : '',
+                  clientHeight:
+                    element.clientHeight,
+                  scrollHeight:
+                    element.scrollHeight,
+                  maxScroll
+                });
+
+                for (
+                  let position = 0;
+                  position <= maxScroll;
+                  position += step
+                ) {
+                  element.scrollTop = position;
+
+                  await delay(650);
+
+                  saveSnapshot(
+                    `container-${index}`,
+                    element.scrollTop,
+                    element
+                  );
+
+                  /*
+                   * 내부 스크롤로 바뀐 전체 화면도 같이 저장합니다.
+                   */
+                  saveSnapshot(
+                    `body-after-container-${index}`,
+                    element.scrollTop
+                  );
+                }
+
+                element.scrollTop = maxScroll;
+                await delay(900);
+
+                saveSnapshot(
+                  `container-${index}-bottom`,
+                  element.scrollTop,
+                  element
+                );
+              }
+
+              window.scrollTo({
+                top: 0,
+                left: 0,
+                behavior: 'instant'
+              });
+
+              for (
+                const element of scrollContainers
+              ) {
+                element.scrollTop = 0;
+              }
+
+              await delay(1000);
+
+              return {
+                snapshots,
+                containerDiagnostics,
+                finalDocumentHeight:
+                  getDocumentHeight()
+              };
+            }
+            """
+        )
+
+        snapshot_sections = []
+
+        for index, snapshot in enumerate(
+            scroll_result.get("snapshots", [])
+        ):
+            snapshot_sections.append(
+                "\n".join(
+                    [
+                        "=" * 80,
+                        f"SNAPSHOT {index + 1}",
+                        f"source: {snapshot.get('source')}",
+                        f"position: {snapshot.get('position')}",
+                        (
+                            "textLength: "
+                            f"{snapshot.get('textLength')}"
+                        ),
+                        "=" * 80,
+                        snapshot.get("text", ""),
+                    ]
+                )
+            )
+
+        snapshot_text = "\n\n".join(
+            snapshot_sections
+        )
+
+        (
+            ARTIFACT_DIR
+            / f"{prefix}-scroll-snapshots.txt"
+        ).write_text(
+            snapshot_text,
+            encoding="utf-8",
+        )
+
+        (
+            ARTIFACT_DIR
+            / f"{prefix}-scroll-containers.json"
+        ).write_text(
+            json.dumps(
+                scroll_result,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        print(
+            f"Saved: {prefix}-scroll-snapshots.txt "
+            f"({len(scroll_result.get('snapshots', []))} snapshots)"
+        )
+        print(
+            f"Saved: {prefix}-scroll-containers.json"
+        )
+
+    except Exception as exc:
+        print(f"Scroll snapshot save failed: {exc}")
+
+    # ------------------------------------------------------------------
+    # 7. HTML 및 script 데이터에서 목표 객실 주변 문맥 추출
+    # ------------------------------------------------------------------
+
+    try:
+        embedded_result = page.evaluate(
+            """
+            ({ searchTerms }) => {
+              const normalize = (value) =>
+                (value || '')
+                  .replace(/\\s+/g, ' ')
+                  .trim();
+
+              const results = [];
+
+              const addContext = (
+                source,
+                content,
+                term
+              ) => {
+                if (!content) {
+                  return;
+                }
+
+                let startIndex = 0;
+                let matchCount = 0;
+
+                while (matchCount < 20) {
+                  const index =
+                    content.indexOf(
+                      term,
+                      startIndex
+                    );
+
+                  if (index < 0) {
+                    break;
+                  }
+
+                  const contextStart =
+                    Math.max(0, index - 500);
+
+                  const contextEnd =
+                    Math.min(
+                      content.length,
+                      index + term.length + 1000
+                    );
+
+                  results.push({
+                    source,
+                    term,
+                    index,
+                    context: normalize(
+                      content.slice(
+                        contextStart,
+                        contextEnd
+                      )
+                    )
+                  });
+
+                  startIndex =
+                    index + term.length;
+
+                  matchCount += 1;
+                }
+              };
+
+              /*
+               * script 태그 안의 JSON이나 초기 상태 데이터 조사.
+               */
+              Array.from(
+                document.querySelectorAll('script')
+              ).forEach((script, index) => {
+                const content =
+                  script.textContent || '';
+
+                for (const term of searchTerms) {
+                  if (content.includes(term)) {
+                    addContext(
+                      `script-${index}` +
+                      (
+                        script.id
+                          ? `#${script.id}`
+                          : ''
+                      ),
+                      content,
+                      term
+                    );
+                  }
+                }
+              });
+
+              /*
+               * 숨겨진 DOM 요소나 일반 DOM에서 목표 문구를 포함하는
+               * 요소를 별도로 수집합니다.
+               */
+              const matchingElements =
+                Array.from(
+                  document.querySelectorAll('*')
+                )
+                  .filter((element) => {
+                    const text =
+                      element.textContent || '';
+
+                    return searchTerms.some(
+                      (term) =>
+                        text.includes(term)
+                    );
+                  })
+                  .sort((a, b) => {
+                    const aLength =
+                      (a.textContent || '').length;
+
+                    const bLength =
+                      (b.textContent || '').length;
+
+                    return aLength - bLength;
+                  })
+                  .slice(0, 100)
+                  .map((element) => {
+                    const style =
+                      window.getComputedStyle(element);
+
+                    const rect =
+                      element.getBoundingClientRect();
+
+                    return {
+                      tag: element.tagName,
+                      id: element.id || '',
+                      className:
+                        typeof element.className ===
+                        'string'
+                          ? element.className
+                          : '',
+                      innerText:
+                        normalize(
+                          element.innerText
+                        ),
+                      textContent:
+                        normalize(
+                          element.textContent
+                        ),
+                      display:
+                        style.display,
+                      visibility:
+                        style.visibility,
+                      opacity:
+                        style.opacity,
+                      width:
+                        rect.width,
+                      height:
+                        rect.height,
+                      inViewport:
+                        rect.bottom >= 0 &&
+                        rect.top <= window.innerHeight
+                    };
+                  });
+
+              return {
+                scriptContexts: results,
+                matchingElements
+              };
+            }
+            """,
+            {
+                "searchTerms": [
+                    "골드",
+                    "클린",
+                    "설악",
+                    "설악마운틴뷰",
+                    "파노라마뷰",
+                    "침대",
+                ]
+            },
+        )
+
+        output_sections = [
+            "SCRIPT / EMBEDDED DATA CONTEXTS",
+            "=" * 80,
+            json.dumps(
+                embedded_result.get(
+                    "scriptContexts",
+                    [],
+                ),
+                ensure_ascii=False,
+                indent=2,
+            ),
+            "",
+            "",
+            "MATCHING DOM ELEMENTS",
+            "=" * 80,
+            json.dumps(
+                embedded_result.get(
+                    "matchingElements",
+                    [],
+                ),
+                ensure_ascii=False,
+                indent=2,
+            ),
+        ]
+
+        embedded_text = "\n".join(
+            output_sections
+        )
+
+        (
+            ARTIFACT_DIR
+            / f"{prefix}-embedded-data.txt"
+        ).write_text(
+            embedded_text,
+            encoding="utf-8",
+        )
+
+        print(
+            f"Saved: {prefix}-embedded-data.txt"
+        )
+
+    except Exception as exc:
+        print(f"Embedded data save failed: {exc}")
+
+    # ------------------------------------------------------------------
+    # 8. 페이지 종합 진단 정보
+    # ------------------------------------------------------------------
 
     try:
         diagnostic = page.evaluate(
             """
             () => {
               const body = document.body;
-              const root = document.documentElement;
+              const root =
+                document.documentElement;
 
               const bodyStyle = body
                 ? window.getComputedStyle(body)
                 : null;
 
+              const scrollableElements =
+                Array.from(
+                  document.querySelectorAll('*')
+                ).filter((element) => {
+                  const style =
+                    window.getComputedStyle(element);
+
+                  return (
+                    ['auto', 'scroll'].includes(
+                      style.overflowY
+                    ) &&
+                    element.scrollHeight >
+                      element.clientHeight + 100
+                  );
+                });
+
+              const scripts =
+                Array.from(
+                  document.querySelectorAll('script')
+                ).map((script, index) => ({
+                  index,
+                  id: script.id || '',
+                  type:
+                    script.getAttribute('type') || '',
+                  src:
+                    script.getAttribute('src') || '',
+                  textLength:
+                    script.textContent?.length ?? 0
+                }));
+
               return {
                 href: location.href,
                 title: document.title,
-                readyState: document.readyState,
-                visibilityState: document.visibilityState,
+                readyState:
+                  document.readyState,
+                visibilityState:
+                  document.visibilityState,
 
-                bodyTextLength:
+                bodyInnerTextLength:
                   body?.innerText?.length ?? 0,
+
+                bodyTextContentLength:
+                  body?.textContent?.length ?? 0,
 
                 bodyHtmlLength:
                   body?.innerHTML?.length ?? 0,
 
                 bodyWidth:
-                  body?.getBoundingClientRect().width ?? 0,
+                  body?.getBoundingClientRect()
+                    .width ?? 0,
 
                 bodyHeight:
-                  body?.getBoundingClientRect().height ?? 0,
+                  body?.getBoundingClientRect()
+                    .height ?? 0,
 
                 scrollWidth:
                   root?.scrollWidth ?? 0,
@@ -247,6 +858,12 @@ def save_debug_files(page: Page, prefix: str) -> None:
 
                 viewportHeight:
                   window.innerHeight,
+
+                scrollX:
+                  window.scrollX,
+
+                scrollY:
+                  window.scrollY,
 
                 devicePixelRatio:
                   window.devicePixelRatio,
@@ -264,7 +881,8 @@ def save_debug_files(page: Page, prefix: str) -> None:
                   bodyStyle?.backgroundColor ?? null,
 
                 elementCount:
-                  document.querySelectorAll('*').length,
+                  document.querySelectorAll('*')
+                    .length,
 
                 buttonCount:
                   document.querySelectorAll(
@@ -272,14 +890,127 @@ def save_debug_files(page: Page, prefix: str) -> None:
                   ).length,
 
                 iframeCount:
-                  document.querySelectorAll('iframe').length
+                  document.querySelectorAll(
+                    'iframe'
+                  ).length,
+
+                scriptCount:
+                  scripts.length,
+
+                scrollableElementCount:
+                  scrollableElements.length,
+
+                scrollableElements:
+                  scrollableElements
+                    .slice(0, 30)
+                    .map((element, index) => {
+                      const style =
+                        window.getComputedStyle(element);
+
+                      return {
+                        index,
+                        tag:
+                          element.tagName,
+                        id:
+                          element.id || '',
+                        className:
+                          typeof element.className ===
+                          'string'
+                            ? element.className
+                            : '',
+                        overflowY:
+                          style.overflowY,
+                        clientHeight:
+                          element.clientHeight,
+                        scrollHeight:
+                          element.scrollHeight,
+                        scrollTop:
+                          element.scrollTop
+                      };
+                    }),
+
+                scripts:
+                  scripts.slice(0, 100),
+
+                targetTerms: {
+                  innerText: {
+                    gold:
+                      body?.innerText
+                        ?.includes('골드') ??
+                      false,
+                    seorak:
+                      body?.innerText
+                        ?.includes('설악') ??
+                      false,
+                    seorakMountainView:
+                      body?.innerText
+                        ?.includes(
+                          '설악마운틴뷰'
+                        ) ??
+                      false,
+                    panorama:
+                      body?.innerText
+                        ?.includes(
+                          '파노라마뷰'
+                        ) ??
+                      false
+                  },
+
+                  textContent: {
+                    gold:
+                      body?.textContent
+                        ?.includes('골드') ??
+                      false,
+                    seorak:
+                      body?.textContent
+                        ?.includes('설악') ??
+                      false,
+                    seorakMountainView:
+                      body?.textContent
+                        ?.includes(
+                          '설악마운틴뷰'
+                        ) ??
+                      false,
+                    panorama:
+                      body?.textContent
+                        ?.includes(
+                          '파노라마뷰'
+                        ) ??
+                      false
+                  },
+
+                  html: {
+                    gold:
+                      document.documentElement
+                        .innerHTML
+                        .includes('골드'),
+                    seorak:
+                      document.documentElement
+                        .innerHTML
+                        .includes('설악'),
+                    seorakMountainView:
+                      document.documentElement
+                        .innerHTML
+                        .includes(
+                          '설악마운틴뷰'
+                        ),
+                    panorama:
+                      document.documentElement
+                        .innerHTML
+                        .includes(
+                          '파노라마뷰'
+                        )
+                  }
+                }
               };
             }
             """
         )
 
-        diagnostic_path = ARTIFACT_DIR / f"{prefix}-diagnostic.json"
-        diagnostic_path.write_text(
+        (
+            ARTIFACT_DIR
+            / f"{prefix}-diagnostic.json"
+        ).write_text(
             json.dumps(
                 diagnostic,
                 ensure_ascii=False,
@@ -287,11 +1018,13 @@ def save_debug_files(page: Page, prefix: str) -> None:
             ),
             encoding="utf-8",
         )
-        print(f"Saved: {prefix}-diagnostic.json")
+
+        print(
+            f"Saved: {prefix}-diagnostic.json"
+        )
 
     except Exception as exc:
         print(f"Diagnostic save failed: {exc}")
-
 
 # ---------------------------------------------------------------------------
 # 렌더링 보조
