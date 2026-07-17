@@ -4,11 +4,12 @@ on:
   workflow_dispatch:
 
   schedule:
-    - cron: "3,13,23,33,43,53 * * * *"
+    - cron: "7 * * * *"
       timezone: "Asia/Seoul"
 
 permissions:
   contents: read
+  issues: write
 
 concurrency:
   group: yanolja-room-monitor
@@ -17,7 +18,7 @@ concurrency:
 jobs:
   check-room:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 70
 
     steps:
       - name: Check out repository
@@ -38,15 +39,84 @@ jobs:
         run: |
           python -m playwright install chromium --with-deps
 
-      - name: Check room availability
+      - name: Check room every 10 minutes
         env:
           TARGET_URL: ${{ secrets.TARGET_URL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python monitor.py
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+
+          for attempt in 1 2 3 4 5 6
+          do
+            echo "============================================================"
+            echo "Monitoring attempt ${attempt}/6"
+            echo "UTC time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "============================================================"
+
+            rm -rf artifacts
+            mkdir -p artifacts
+
+            python monitor.py
+            exit_code=$?
+
+            if [ "$exit_code" -eq 10 ]; then
+              echo "Room is available."
+
+              issue_title="🚨 델피노 목표 객실 예약 가능"
+
+              existing_issue_count=$(
+                gh issue list \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --state open \
+                  --search "\"${issue_title}\" in:title" \
+                  --json number \
+                  --jq 'length'
+              )
+
+              if [ "$existing_issue_count" -eq 0 ]; then
+                gh issue create \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --title "$issue_title" \
+                  --assignee "$GITHUB_REPOSITORY_OWNER" \
+                  --body "$(cat <<EOF
+          야놀자에서 목표 객실의 활성화된 **예약하기** 버튼을 확인했습니다.
+
+          - 대상 객실: 골드-클린/설악마운틴뷰/침대
+          - 확인 시각: $(TZ=Asia/Seoul date '+%Y-%m-%d %H:%M:%S KST')
+          - 검사 회차: ${attempt}/6
+          - [GitHub Actions 실행 결과](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})
+
+          야놀자 페이지에서 재고를 직접 확인하세요.
+
+          이 Issue를 닫으면 이후 객실이 다시 발견됐을 때 새 알림 Issue가 생성됩니다.
+          EOF
+          )"
+
+                echo "Notification issue created."
+              else
+                echo "An open availability issue already exists."
+              fi
+
+              exit 0
+            fi
+
+            if [ "$exit_code" -eq 2 ]; then
+              echo "Access restriction detected."
+              exit 2
+            fi
+
+            if [ "$attempt" -lt 6 ]; then
+              echo "Waiting 10 minutes..."
+              sleep 600
+            fi
+          done
+
+          exit 0
 
       - name: Upload diagnostic files
-        if: ${{ failure() || hashFiles('artifacts/*') != '' }}
+        if: ${{ always() && hashFiles('artifacts/*') != '' }}
         uses: actions/upload-artifact@v6
         with:
           name: yanolja-monitor-${{ github.run_number }}
