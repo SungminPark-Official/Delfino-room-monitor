@@ -170,10 +170,6 @@ def save_debug_files(page: Page, prefix: str) -> None:
     - {prefix}-diagnostic.json
     """
 
-    # ------------------------------------------------------------------
-    # 1. 현재 viewport 스크린샷
-    # ------------------------------------------------------------------
-
     try:
         page.screenshot(
             path=str(ARTIFACT_DIR / f"{prefix}-viewport.png"),
@@ -186,10 +182,6 @@ def save_debug_files(page: Page, prefix: str) -> None:
     except Exception as exc:
         print(f"Viewport screenshot failed: {exc}")
 
-    # ------------------------------------------------------------------
-    # 2. 전체 페이지 스크린샷
-    # ------------------------------------------------------------------
-
     try:
         page.screenshot(
             path=str(ARTIFACT_DIR / f"{prefix}-full.png"),
@@ -201,10 +193,6 @@ def save_debug_files(page: Page, prefix: str) -> None:
         print(f"Saved: {prefix}-full.png")
     except Exception as exc:
         print(f"Full-page screenshot failed: {exc}")
-
-    # ------------------------------------------------------------------
-    # 3. 전체 HTML
-    # ------------------------------------------------------------------
 
     html = ""
 
@@ -221,10 +209,6 @@ def save_debug_files(page: Page, prefix: str) -> None:
         print(f"Saved: {prefix}.html")
     except Exception as exc:
         print(f"HTML save failed: {exc}")
-
-    # ------------------------------------------------------------------
-    # 4. 현재 화면에서 보이는 텍스트: innerText
-    # ------------------------------------------------------------------
 
     try:
         inner_text = page.locator("body").inner_text(
@@ -244,10 +228,6 @@ def save_debug_files(page: Page, prefix: str) -> None:
         )
     except Exception as exc:
         print(f"Body innerText save failed: {exc}")
-
-    # ------------------------------------------------------------------
-    # 5. 숨겨진 DOM 요소까지 포함한 텍스트: textContent
-    # ------------------------------------------------------------------
 
     try:
         text_content = (
@@ -270,10 +250,6 @@ def save_debug_files(page: Page, prefix: str) -> None:
         )
     except Exception as exc:
         print(f"Body textContent save failed: {exc}")
-
-    # ------------------------------------------------------------------
-    # 6. 스크롤 각 지점에서 보이는 텍스트 누적
-    # ------------------------------------------------------------------
 
     try:
         scroll_result = page.evaluate(
@@ -323,10 +299,6 @@ def save_debug_files(page: Page, prefix: str) -> None:
                   document.documentElement?.scrollHeight ?? 0
                 );
 
-              /*
-               * 전체 문서 스크롤.
-               * 끝에서 한 번 읽는 것이 아니라 각 위치의 텍스트를 저장합니다.
-               */
               let previousDocumentHeight = -1;
 
               for (let cycle = 0; cycle < 4; cycle += 1) {
@@ -383,10 +355,6 @@ def save_debug_files(page: Page, prefix: str) -> None:
                   newHeight;
               }
 
-              /*
-               * overflow:auto 또는 overflow:scroll인
-               * 내부 스크롤 컨테이너도 순회합니다.
-               */
               const scrollContainers =
                 Array.from(
                   document.querySelectorAll('*')
@@ -457,9 +425,6 @@ def save_debug_files(page: Page, prefix: str) -> None:
                     element
                   );
 
-                  /*
-                   * 내부 스크롤로 바뀐 전체 화면도 같이 저장합니다.
-                   */
                   saveSnapshot(
                     `body-after-container-${index}`,
                     element.scrollTop
@@ -557,10 +522,6 @@ def save_debug_files(page: Page, prefix: str) -> None:
     except Exception as exc:
         print(f"Scroll snapshot save failed: {exc}")
 
-    # ------------------------------------------------------------------
-    # 7. HTML 및 script 데이터에서 목표 객실 주변 문맥 추출
-    # ------------------------------------------------------------------
-
     try:
         embedded_result = page.evaluate(
             """
@@ -623,9 +584,6 @@ def save_debug_files(page: Page, prefix: str) -> None:
                 }
               };
 
-              /*
-               * script 태그 안의 JSON이나 초기 상태 데이터 조사.
-               */
               Array.from(
                 document.querySelectorAll('script')
               ).forEach((script, index) => {
@@ -648,10 +606,6 @@ def save_debug_files(page: Page, prefix: str) -> None:
                 }
               });
 
-              /*
-               * 숨겨진 DOM 요소나 일반 DOM에서 목표 문구를 포함하는
-               * 요소를 별도로 수집합니다.
-               */
               const matchingElements =
                 Array.from(
                   document.querySelectorAll('*')
@@ -775,10 +729,6 @@ def save_debug_files(page: Page, prefix: str) -> None:
 
     except Exception as exc:
         print(f"Embedded data save failed: {exc}")
-
-    # ------------------------------------------------------------------
-    # 8. 페이지 종합 진단 정보
-    # ------------------------------------------------------------------
 
     try:
         diagnostic = page.evaluate(
@@ -1026,6 +976,7 @@ def save_debug_files(page: Page, prefix: str) -> None:
     except Exception as exc:
         print(f"Diagnostic save failed: {exc}")
 
+
 # ---------------------------------------------------------------------------
 # 렌더링 보조
 # ---------------------------------------------------------------------------
@@ -1094,7 +1045,7 @@ def force_desktop_render(page: Page) -> None:
 
 
 def wait_for_render(page: Page) -> None:
-    """주요 로딩 상태를 기다리고 렌더링을 유도합니다."""
+    """초기 페이지 로딩만 기다립니다."""
 
     try:
         page.wait_for_load_state(
@@ -1114,12 +1065,129 @@ def wait_for_render(page: Page) -> None:
     except PlaywrightTimeoutError:
         print("Network idle timeout; continuing.")
 
-    # React/Next.js 앱이 초기 렌더링을 마칠 시간을 줍니다.
     page.wait_for_timeout(10_000)
 
-    force_desktop_render(page)
 
-    page.wait_for_timeout(3_000)
+def scroll_until_target_room(page: Page) -> bool:
+    """
+    전체 문서와 내부 스크롤 컨테이너를 단계적으로 이동하면서
+    목표 객실이 실제 innerText에 나타나는 순간 멈춥니다.
+    """
+
+    return page.evaluate(
+        """
+        async ({ requiredTerms }) => {
+          const delay = (ms) =>
+            new Promise((resolve) => setTimeout(resolve, ms));
+
+          const normalize = (value) =>
+            (value || '')
+              .replace(/\\s+/g, ' ')
+              .trim();
+
+          const targetIsVisible = () => {
+            const bodyText = normalize(
+              document.body?.innerText
+            );
+
+            return requiredTerms.every(
+              (term) => bodyText.includes(term)
+            );
+          };
+
+          if (targetIsVisible()) {
+            return true;
+          }
+
+          let previousHeight = -1;
+
+          for (let cycle = 0; cycle < 4; cycle += 1) {
+            const documentHeight = Math.max(
+              document.body?.scrollHeight ?? 0,
+              document.documentElement?.scrollHeight ?? 0
+            );
+
+            const step = Math.max(
+              Math.floor(window.innerHeight * 0.45),
+              350
+            );
+
+            for (
+              let position = 0;
+              position <= documentHeight;
+              position += step
+            ) {
+              window.scrollTo({
+                top: position,
+                left: 0,
+                behavior: 'instant'
+              });
+
+              await delay(700);
+
+              if (targetIsVisible()) {
+                return true;
+              }
+            }
+
+            const newHeight = Math.max(
+              document.body?.scrollHeight ?? 0,
+              document.documentElement?.scrollHeight ?? 0
+            );
+
+            if (newHeight === previousHeight) {
+              break;
+            }
+
+            previousHeight = newHeight;
+          }
+
+          const scrollContainers = Array.from(
+            document.querySelectorAll('*')
+          ).filter((element) => {
+            const style =
+              window.getComputedStyle(element);
+
+            return (
+              ['auto', 'scroll'].includes(style.overflowY) &&
+              element.scrollHeight >
+                element.clientHeight + 100 &&
+              element.clientHeight > 100
+            );
+          });
+
+          for (const element of scrollContainers) {
+            const maxScroll =
+              element.scrollHeight -
+              element.clientHeight;
+
+            const step = Math.max(
+              Math.floor(element.clientHeight * 0.45),
+              250
+            );
+
+            for (
+              let position = 0;
+              position <= maxScroll;
+              position += step
+            ) {
+              element.scrollTop = position;
+
+              await delay(700);
+
+              if (targetIsVisible()) {
+                return true;
+              }
+            }
+          }
+
+          return false;
+        }
+        """,
+        {
+            "requiredTerms": REQUIRED_TERMS,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1417,7 +1485,6 @@ def main() -> int:
 
         page = context.new_page()
 
-        # 브라우저 내부 오류를 GitHub Actions 로그에 출력합니다.
         page.on(
             "console",
             lambda message: print(
@@ -1479,6 +1546,15 @@ def main() -> int:
 
             wait_for_render(page)
 
+            target_rendered = scroll_until_target_room(page)
+
+            print(
+                "Target room rendered during scrolling: "
+                f"{target_rendered}"
+            )
+
+            page.wait_for_timeout(1_500)
+
             body_text = page.locator("body").inner_text(
                 timeout=20_000,
             )
@@ -1491,9 +1567,6 @@ def main() -> int:
                 "Body text preview: "
                 f"{normalized_body[:1000]}"
             )
-
-            # 진단 단계에서는 매번 저장합니다.
-            save_debug_files(page, "page-render")
 
             blocked_detected = any(
                 term.lower() in normalized_body.lower()
@@ -1518,6 +1591,8 @@ def main() -> int:
                 return 2
 
             room_status = inspect_target_room(page)
+
+            save_debug_files(page, "page-render")
 
             if room_status is None:
                 print("RESULT: NOT_FOUND")
@@ -1622,7 +1697,7 @@ def main() -> int:
             )
 
         except PlaywrightTimeoutError as exc:
-            print(f"RESULT: ERROR")
+            print("RESULT: ERROR")
             print(f"Page timeout: {exc}")
 
             save_debug_files(page, "timeout")
