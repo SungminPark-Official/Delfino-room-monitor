@@ -1070,8 +1070,8 @@ def wait_for_render(page: Page) -> None:
 
 def scroll_until_target_room(page: Page) -> bool:
     """
-    전체 문서와 내부 스크롤 컨테이너를 단계적으로 이동하면서
-    목표 객실이 실제 innerText에 나타나는 순간 멈춥니다.
+    스크롤하면서 목표 객실을 포함하는 가장 작은 가시 요소를 찾고,
+    이후 판정 함수가 사용할 수 있도록 DOM에 표시합니다.
     """
 
     return page.evaluate(
@@ -1085,17 +1085,83 @@ def scroll_until_target_room(page: Page) -> bool:
               .replace(/\\s+/g, ' ')
               .trim();
 
-          const targetIsVisible = () => {
-            const bodyText = normalize(
-              document.body?.innerText
-            );
+          const isVisible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
 
-            return requiredTerms.every(
-              (term) => bodyText.includes(term)
+            return (
+              style.display !== 'none' &&
+              style.visibility !== 'hidden' &&
+              style.opacity !== '0' &&
+              rect.width > 0 &&
+              rect.height > 0
             );
           };
 
-          if (targetIsVisible()) {
+          const findTargetElement = () => {
+            document
+              .querySelectorAll(
+                '[data-yanolja-target-room="true"]'
+              )
+              .forEach((element) => {
+                element.removeAttribute(
+                  'data-yanolja-target-room'
+                );
+              });
+
+            const candidates = Array.from(
+              document.querySelectorAll(
+                'article, li, section, div'
+              )
+            )
+              .filter((element) => {
+                if (!isVisible(element)) {
+                  return false;
+                }
+
+                const text = normalize(element.innerText);
+
+                if (
+                  !text ||
+                  text.length < 10 ||
+                  text.length > 6000
+                ) {
+                  return false;
+                }
+
+                return requiredTerms.every(
+                  (term) => text.includes(term)
+                );
+              })
+              .sort((a, b) => {
+                const aLength =
+                  normalize(a.innerText).length;
+
+                const bLength =
+                  normalize(b.innerText).length;
+
+                return aLength - bLength;
+              });
+
+            if (candidates.length === 0) {
+              return false;
+            }
+
+            candidates[0].setAttribute(
+              'data-yanolja-target-room',
+              'true'
+            );
+
+            candidates[0].scrollIntoView({
+              block: 'center',
+              inline: 'nearest',
+              behavior: 'instant'
+            });
+
+            return true;
+          };
+
+          if (findTargetElement()) {
             return true;
           }
 
@@ -1108,8 +1174,8 @@ def scroll_until_target_room(page: Page) -> bool:
             );
 
             const step = Math.max(
-              Math.floor(window.innerHeight * 0.45),
-              350
+              Math.floor(window.innerHeight * 0.4),
+              300
             );
 
             for (
@@ -1125,7 +1191,8 @@ def scroll_until_target_room(page: Page) -> bool:
 
               await delay(700);
 
-              if (targetIsVisible()) {
+              if (findTargetElement()) {
+                await delay(500);
                 return true;
               }
             }
@@ -1162,8 +1229,8 @@ def scroll_until_target_room(page: Page) -> bool:
               element.clientHeight;
 
             const step = Math.max(
-              Math.floor(element.clientHeight * 0.45),
-              250
+              Math.floor(element.clientHeight * 0.4),
+              200
             );
 
             for (
@@ -1175,7 +1242,8 @@ def scroll_until_target_room(page: Page) -> bool:
 
               await delay(700);
 
-              if (targetIsVisible()) {
+              if (findTargetElement()) {
+                await delay(500);
                 return true;
               }
             }
@@ -1196,18 +1264,13 @@ def scroll_until_target_room(page: Page) -> bool:
 
 def inspect_target_room(page: Page) -> dict[str, Any] | None:
     """
-    목표 객실명 요소를 찾고 상위 DOM을 단계적으로 추적합니다.
-
-    반환 상태:
-    - AVAILABLE
-    - UNAVAILABLE
-    - UNKNOWN
+    scroll_until_target_room()이 표시해 둔 목표 객실 요소에서 시작해
+    상위 DOM을 탐색하며 예약 가능 여부를 판정합니다.
     """
 
     return page.evaluate(
         """
         ({
-          requiredTerms,
           unavailableTerms,
           availableButtonTerms
         }) => {
@@ -1216,12 +1279,13 @@ def inspect_target_room(page: Page) -> dict[str, Any] | None:
               .replace(/\\s+/g, ' ')
               .trim();
 
-          const uniqueByTextAndTag = (items) => {
+          const uniqueControls = (items) => {
             const seen = new Set();
 
             return items.filter((item) => {
               const key =
-                `${item.tag}|${item.text}|${item.disabled}`;
+                `${item.tag}|${item.text}|` +
+                `${item.disabled}|${item.href}`;
 
               if (seen.has(key)) {
                 return false;
@@ -1232,203 +1296,178 @@ def inspect_target_room(page: Page) -> dict[str, Any] | None:
             });
           };
 
-          const allElements = Array.from(
-            document.querySelectorAll(
-              'div, span, p, strong, b, h1, h2, h3, h4, h5, li, article, section'
-            )
+          const targetElement = document.querySelector(
+            '[data-yanolja-target-room="true"]'
           );
 
-          const roomNameElements = allElements
-            .filter((element) => {
-              const text = normalize(element.innerText);
-
-              if (!text || text.length > 250) {
-                return false;
-              }
-
-              return requiredTerms.every(
-                (term) => text.includes(term)
-              );
-            })
-            .sort((a, b) => {
-              const aLength = normalize(a.innerText).length;
-              const bLength = normalize(b.innerText).length;
-
-              return aLength - bLength;
-            });
-
-          if (roomNameElements.length === 0) {
+          if (!targetElement) {
             return null;
           }
 
+          const targetText =
+            normalize(targetElement.innerText);
+
           const inspectedAncestors = [];
 
-          for (const roomNameElement of roomNameElements) {
-            let current = roomNameElement;
+          let current = targetElement;
 
-            for (
-              let depth = 0;
-              depth <= 12 && current;
-              depth += 1
-            ) {
-              const text = normalize(current.innerText);
+          for (
+            let depth = 0;
+            depth <= 12 && current;
+            depth += 1
+          ) {
+            const text = normalize(current.innerText);
 
-              if (!text) {
-                current = current.parentElement;
-                continue;
-              }
+            if (!text) {
+              current = current.parentElement;
+              continue;
+            }
 
-              if (text.length > 6000) {
-                break;
-              }
+            if (text.length > 10000) {
+              break;
+            }
 
-              const controls = uniqueByTextAndTag(
-                Array.from(
-                  current.querySelectorAll(
-                    'button, a, [role="button"]'
-                  )
-                ).map((control) => {
-                  const style =
-                    window.getComputedStyle(control);
+            const controls = uniqueControls(
+              Array.from(
+                current.querySelectorAll(
+                  'button, a, [role="button"]'
+                )
+              ).map((control) => {
+                const style =
+                  window.getComputedStyle(control);
 
-                  const rect =
-                    control.getBoundingClientRect();
+                const rect =
+                  control.getBoundingClientRect();
 
-                  return {
-                    tag: control.tagName,
-                    text: normalize(control.innerText),
-                    disabled:
-                      control.disabled === true ||
-                      control.hasAttribute('disabled') ||
-                      control.getAttribute('aria-disabled') === 'true',
-                    href:
-                      control.getAttribute('href'),
-                    visible:
-                      style.display !== 'none' &&
-                      style.visibility !== 'hidden' &&
-                      style.opacity !== '0' &&
-                      rect.width > 0 &&
-                      rect.height > 0
-                  };
-                })
+                return {
+                  tag: control.tagName,
+                  text: normalize(control.innerText),
+                  disabled:
+                    control.disabled === true ||
+                    control.hasAttribute('disabled') ||
+                    control.getAttribute(
+                      'aria-disabled'
+                    ) === 'true',
+                  href:
+                    control.getAttribute('href'),
+                  visible:
+                    style.display !== 'none' &&
+                    style.visibility !== 'hidden' &&
+                    style.opacity !== '0' &&
+                    rect.width > 0 &&
+                    rect.height > 0
+                };
+              })
+            );
+
+            const unavailableMatches =
+              unavailableTerms.filter(
+                (term) => text.includes(term)
               );
 
-              const unavailableMatches =
-                unavailableTerms.filter(
-                  (term) => text.includes(term)
+            const priceMatches =
+              text.match(
+                /(?:\\d{1,3}(?:,\\d{3})+|\\d+)\\s*원/g
+              ) || [];
+
+            const availableControls =
+              controls.filter((control) => {
+                if (
+                  control.disabled ||
+                  !control.visible
+                ) {
+                  return false;
+                }
+
+                return availableButtonTerms.some(
+                  (term) =>
+                    control.text.includes(term)
                 );
+              });
 
-              const priceMatches =
-                text.match(
-                  /(?:\\d{1,3}(?:,\\d{3})+|\\d+)\\s*원/g
-                ) || [];
-
-              const availableControls =
-                controls.filter((control) => {
-                  if (
-                    control.disabled ||
-                    !control.visible
-                  ) {
-                    return false;
-                  }
-
-                  return availableButtonTerms.some(
+            const unavailableControls =
+              controls.filter((control) => {
+                const unavailableText =
+                  unavailableTerms.some(
                     (term) =>
                       control.text.includes(term)
                   );
-                });
 
-              const unavailableControls =
-                controls.filter((control) => {
-                  const unavailableControlText =
-                    unavailableTerms.some(
-                      (term) =>
-                        control.text.includes(term)
-                    );
+                return (
+                  control.disabled ||
+                  unavailableText
+                );
+              });
 
-                  return (
-                    control.disabled ||
-                    unavailableControlText
-                  );
-                });
+            const hasUsefulContext =
+              controls.length > 0 ||
+              priceMatches.length > 0 ||
+              unavailableMatches.length > 0;
 
-              const hasUsefulContext =
-                controls.length > 0 ||
-                priceMatches.length > 0 ||
-                unavailableMatches.length > 0;
+            inspectedAncestors.push({
+              depth,
+              tag: current.tagName,
+              textLength: text.length,
+              text,
+              controls,
+              priceMatches,
+              unavailableMatches,
+              availableControlCount:
+                availableControls.length,
+              unavailableControlCount:
+                unavailableControls.length,
+              hasUsefulContext
+            });
 
-              inspectedAncestors.push({
+            if (hasUsefulContext) {
+              let status = 'UNKNOWN';
+              let reason =
+                '객실은 찾았지만 예약 가능 여부를 확정할 신호가 부족합니다.';
+
+              if (unavailableMatches.length > 0) {
+                status = 'UNAVAILABLE';
+                reason =
+                  '객실 카드 안에서 예약 불가 문구가 발견됐습니다.';
+              } else if (availableControls.length > 0) {
+                status = 'AVAILABLE';
+                reason =
+                  '객실 카드 안에서 활성화된 예약 관련 버튼이 발견됐습니다.';
+              } else if (
+                unavailableControls.length > 0 &&
+                availableControls.length === 0
+              ) {
+                status = 'UNAVAILABLE';
+                reason =
+                  '객실 카드 안의 예약 관련 버튼이 비활성화돼 있습니다.';
+              }
+
+              return {
+                status,
+                reason,
+                roomNameText: targetText,
                 depth,
                 tag: current.tagName,
-                textLength: text.length,
                 text,
                 controls,
                 priceMatches,
                 unavailableMatches,
-                availableControlCount:
-                  availableControls.length,
-                unavailableControlCount:
-                  unavailableControls.length,
-                hasUsefulContext
-              });
-
-              if (hasUsefulContext) {
-                let status = 'UNKNOWN';
-                let reason =
-                  '객실명은 찾았지만 예약 가능 여부를 확정할 신호가 부족합니다.';
-
-                if (
-                  unavailableMatches.length > 0
-                ) {
-                  status = 'UNAVAILABLE';
-                  reason =
-                    '객실 카드 안에서 예약 불가 문구가 발견됐습니다.';
-                } else if (
-                  availableControls.length > 0
-                ) {
-                  status = 'AVAILABLE';
-                  reason =
-                    '객실 카드 안에서 활성화된 예약 관련 버튼이 발견됐습니다.';
-                } else if (
-                  unavailableControls.length > 0 &&
-                  availableControls.length === 0
-                ) {
-                  status = 'UNAVAILABLE';
-                  reason =
-                    '객실 카드 안의 예약 관련 버튼이 비활성화돼 있습니다.';
-                }
-
-                return {
-                  status,
-                  reason,
-                  roomNameText:
-                    normalize(roomNameElement.innerText),
-                  depth,
-                  tag: current.tagName,
-                  text,
-                  controls,
-                  priceMatches,
-                  unavailableMatches,
-                  inspectedAncestors
-                };
-              }
-
-              current = current.parentElement;
+                inspectedAncestors
+              };
             }
+
+            current = current.parentElement;
           }
 
           return {
             status: 'UNKNOWN',
             reason:
-              '목표 객실명은 발견했지만 상태 문구, 가격 또는 버튼이 있는 상위 카드를 찾지 못했습니다.',
-            roomNameText:
-              normalize(roomNameElements[0].innerText),
+              '목표 객실은 발견했지만 가격, 상태 문구 또는 예약 버튼이 있는 상위 카드를 찾지 못했습니다.',
+            roomNameText: targetText,
             inspectedAncestors
           };
         }
         """,
         {
-            "requiredTerms": REQUIRED_TERMS,
             "unavailableTerms": UNAVAILABLE_TERMS,
             "availableButtonTerms": AVAILABLE_BUTTON_TERMS,
         },
